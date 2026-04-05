@@ -27,11 +27,35 @@ random_endpoint() {
     echo "$ENDPOINTS" | grep -v '^$' | shuf -n 1
 }
 
+# 在主命名空间内解析 Endpoint hostname 为 IP，避免 netns 内无 DNS 导致 wg-quick 卡住
+resolve_endpoint() {
+    local endpoint="$1"
+    local host="${endpoint%:*}"
+    local port="${endpoint##*:}"
+
+    case "$host" in
+        *[!0-9.]*)
+            # 是 hostname，需要解析
+            local resolved
+            resolved=$(nslookup "$host" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n 1)
+            if [ -n "$resolved" ]; then
+                printf '%s:%s\n' "$resolved" "$port"
+            else
+                return 1
+            fi
+            ;;
+        *)
+            # 已经是 IP
+            printf '%s\n' "$endpoint"
+            ;;
+    esac
+}
+
 # 清洗 wgcf 生成的配置文件
+# 参数: $1=配置路径  $2=是否强制替换 endpoint (rotate 时传 "rotate")
 sanitize_wg_conf() {
     local conf="$1"
-    local endpoint
-    endpoint=$(random_endpoint)
+    local mode="${2:-init}"
 
     local ipv4_addr
     ipv4_addr=$(grep '^Address' "$conf" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
@@ -51,7 +75,28 @@ sanitize_wg_conf() {
         sed -i 's/PersistentKeepalive.*/PersistentKeepalive = 15/g' "$conf"
     fi
 
-    sed -i "s/^Endpoint.*/Endpoint = $endpoint/g" "$conf"
+    # Endpoint 策略:
+    # - 用户设置了 ENDPOINT_IP → 始终使用
+    # - 轮换模式 (mode=rotate) → 随机选择新 endpoint
+    # - 初始化模式 (mode=init) → 保留原始 endpoint，但解析 hostname 为 IP
+    if [ -n "${ENDPOINT_IP:-}" ]; then
+        sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$conf"
+    elif [ "$mode" = "rotate" ]; then
+        local endpoint
+        endpoint=$(random_endpoint)
+        sed -i "s/^Endpoint.*/Endpoint = $endpoint/g" "$conf"
+    else
+        # 初始化模式: 解析 hostname 防止 netns 内无 DNS
+        local endpoint resolved_endpoint
+        endpoint=$(sed -n 's/^Endpoint *= *//p' "$conf" | head -n 1)
+        if [ -n "$endpoint" ]; then
+            resolved_endpoint=$(resolve_endpoint "$endpoint") || {
+                echo "==> [MicroWARP] ⚠️ 无法解析 Endpoint: $endpoint" >&2
+                return 1
+            }
+            sed -i "s/^Endpoint.*/Endpoint = $resolved_endpoint/g" "$conf"
+        fi
+    fi
 }
 
 # 获取出口 IP (纯 IP 字符串，已清洗)

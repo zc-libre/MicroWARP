@@ -29,7 +29,7 @@ RUN WGCF_VER=$(curl -sL https://api.github.com/repos/ViRb3/wgcf/releases/latest 
 FROM alpine:latest
 
 # 安装运行依赖: WireGuard + 网络工具 + flock(util-linux) + tini(PID 1)
-RUN apk add --no-cache wireguard-tools iptables iproute2 wget curl util-linux tini coreutils
+RUN apk add --no-cache wireguard-tools iptables iproute2 wget curl util-linux tini coreutils busybox-extras
 
 # 打包 microsocks
 COPY --from=builder /src/microsocks /usr/local/bin/microsocks

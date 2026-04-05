@@ -94,6 +94,10 @@ init_pool_member() {
     echo "==> [MicroWARP] 初始化池成员 #${id}..."
     mkdir -p "$conf_dir"
 
+    # 清理残留的 netns 和 veth (容器重启后可能存在)
+    ip netns delete "$ns" 2>/dev/null || true
+    ip link delete "$veth" 2>/dev/null || true
+
     # 创建网络命名空间 + veth pair
     ip netns add "$ns"
     ip link add "$veth" type veth peer name "$veth_ns"
@@ -123,13 +127,23 @@ init_pool_member() {
         echo "==> [MicroWARP] 池成员 #${id} 已有配置，跳过注册"
     fi
 
-    sanitize_wg_conf "${conf_dir}/wg0.conf"
+    if ! sanitize_wg_conf "${conf_dir}/wg0.conf"; then
+        echo "==> [MicroWARP] ❌ 池成员 #${id} 配置清洗失败" >&2
+        return 1
+    fi
 
     # 删除 wg-quick 不兼容标记
     sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
 
     # 在 netns 中启动 WireGuard
     ip netns exec "$ns" wg-quick up "${conf_dir}/wg0.conf" > /dev/null 2>&1
+
+    # 添加 Docker 子网回程路由 (DNAT 回程需要走 veth 而非 wg0)
+    local docker_subnet
+    docker_subnet=$(ip route show dev eth0 proto kernel | head -1 | cut -d' ' -f1)
+    if [ -n "$docker_subnet" ]; then
+        ip netns exec "$ns" ip route add "$docker_subnet" via "$main_ip" dev "$veth_ns" 2>/dev/null || true
+    fi
 
     # 在 netns 中启动 microsocks
     local socks_args="-i 0.0.0.0 -p 1080"
@@ -163,16 +177,20 @@ setup_iptables_loadbalance() {
         local target_ip="10.200.${i}.2"
 
         if [ $remaining -eq 1 ]; then
-            iptables -t nat -A MICROWARP_POOL -j DNAT --to-destination "${target_ip}:1080"
+            iptables -t nat -A MICROWARP_POOL -p tcp -j DNAT --to-destination "${target_ip}:1080"
         else
-            iptables -t nat -A MICROWARP_POOL \
+            iptables -t nat -A MICROWARP_POOL -p tcp \
                 -m statistic --mode nth --every "$remaining" --packet 0 \
                 -j DNAT --to-destination "${target_ip}:1080"
         fi
         i=$((i + 1))
     done
 
-    # MASQUERADE 回程流量
+    # FORWARD 规则: 允许 veth ↔ eth0 转发 (nf_tables 后端需要显式规则)
+    iptables -A FORWARD -i veth+ -o eth0 -j ACCEPT 2>/dev/null || true
+    iptables -A FORWARD -i eth0 -o veth+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+    # MASQUERADE: netns 出站流量 (WireGuard endpoint UDP)
     iptables -t nat -A POSTROUTING -s 10.200.0.0/16 -j MASQUERADE
 
     echo "==> [MicroWARP] iptables 轮询负载均衡已配置 (${pool_size} 个成员)"

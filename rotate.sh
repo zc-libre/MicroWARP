@@ -66,9 +66,9 @@ rebuild_dnat_chain() {
         done
 
         if [ $active_remaining -le 1 ]; then
-            iptables -t nat -A MICROWARP_POOL -j DNAT --to-destination "${target_ip}:1080"
+            iptables -t nat -A MICROWARP_POOL -p tcp -j DNAT --to-destination "${target_ip}:1080"
         else
-            iptables -t nat -A MICROWARP_POOL \
+            iptables -t nat -A MICROWARP_POOL -p tcp \
                 -m statistic --mode nth --every "$active_remaining" --packet 0 \
                 -j DNAT --to-destination "${target_ip}:1080"
         fi
@@ -103,7 +103,7 @@ rebuild_dnat_chain() {
         cd /app
         rm -rf "$tmpdir"
 
-        sanitize_wg_conf "$CONF"
+        sanitize_wg_conf "$CONF" rotate
 
         if ! wg-quick up wg0 > /dev/null 2>&1; then
             echo "==> [Rotate] ⚠️ wg-quick up 失败，回滚旧配置..." >&2
