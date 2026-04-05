@@ -1,0 +1,44 @@
+#!/bin/sh
+# CGI: 轮换指定或随机池成员的 IP
+# 用法: /cgi-bin/rotate?id=0  或  /cgi-bin/rotate (随机)
+
+printf "Content-Type: application/json\r\n\r\n"
+
+POOL_SIZE="${POOL_SIZE:-1}"
+
+# 解析 query string 中的 id 参数
+POOL_ID=""
+if [ -n "${QUERY_STRING:-}" ]; then
+    # 严格提取: 仅匹配 id= 后跟纯数字
+    RAW_ID=$(echo "$QUERY_STRING" | sed -n 's/.*id=\([^&]*\).*/\1/p')
+    if [ -n "$RAW_ID" ]; then
+        # 验证提取值为纯数字
+        case "$RAW_ID" in
+            *[!0-9]*)
+                echo '{"error":"invalid pool_id","detail":"id must be numeric"}'
+                exit 0
+                ;;
+        esac
+        POOL_ID="$RAW_ID"
+    fi
+fi
+
+# 未指定 id 则随机选一个
+if [ -z "$POOL_ID" ]; then
+    POOL_ID=$(shuf -i 0-$((POOL_SIZE - 1)) -n 1)
+fi
+
+if [ "$POOL_ID" -ge "$POOL_SIZE" ]; then
+    echo "{\"error\":\"pool_id out of range\",\"max\":$((POOL_SIZE-1))}"
+    exit 0
+fi
+
+# 执行轮换 (stdout 是 JSON, stderr 是日志)
+RESULT=$(/app/rotate.sh "$POOL_ID" 2>/dev/null)
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ] && [ -n "$RESULT" ]; then
+    echo "$RESULT"
+else
+    echo "{\"status\":\"error\",\"pool_id\":${POOL_ID}}"
+fi

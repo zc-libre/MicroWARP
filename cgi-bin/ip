@@ -1,0 +1,23 @@
+#!/bin/sh
+# CGI: 查询所有池成员的出口 IP
+
+. /app/lib.sh
+
+printf "Content-Type: application/json\r\n\r\n"
+
+POOL_SIZE="${POOL_SIZE:-1}"
+
+if [ "$POOL_SIZE" -le 1 ]; then
+    IP=$(get_exit_ip)
+    printf '{"pool_size":1,"members":[{"id":0,"ip":"%s"}]}\n' "${IP:-unknown}"
+else
+    printf '{"pool_size":%d,"members":[' "$POOL_SIZE"
+    i=0
+    while [ $i -lt "$POOL_SIZE" ]; do
+        IP=$(get_exit_ip "warp${i}")
+        [ $i -gt 0 ] && printf ','
+        printf '{"id":%d,"ip":"%s"}' "$i" "${IP:-unknown}"
+        i=$((i + 1))
+    done
+    printf ']}\n'
+fi

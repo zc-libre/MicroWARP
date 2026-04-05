@@ -1,130 +1,295 @@
 #!/bin/sh
 set -e
 
-build_wgcf_download_url() {
-    WGCF_VER=$1
-    WGCF_ARCH=$2
-    RAW_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/wgcf_${WGCF_VER}_linux_${WGCF_ARCH}"
+# ==========================================
+# MicroWARP 入口脚本 (池化版)
+# 支持 POOL_SIZE 个独立 WARP 隧道，连接级隔离
+# ==========================================
 
-    if [ -n "${GH_PROXY:-}" ]; then
-        echo "${GH_PROXY%/}/${RAW_URL}"
-        return 0
-    fi
+. /app/lib.sh
 
-    echo "$RAW_URL"
-}
+POOL_SIZE=${POOL_SIZE:-1}
+LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
+LISTEN_PORT=${BIND_PORT:-"1080"}
+WG_DIR="/etc/wireguard"
+POOL_DIR="${WG_DIR}/pool"
 
 if [ "${MICROWARP_TEST_MODE:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-WG_CONF="/etc/wireguard/wg0.conf"
-mkdir -p /etc/wireguard
-
 # ==========================================
-# 1. 账号全自动申请与配置生成 (阅后即焚)
+# 单实例模式 (POOL_SIZE=1, 向后兼容)
 # ==========================================
-if [ ! -f "$WG_CONF" ]; then
-    echo "==> [MicroWARP] 未检测到配置，正在全自动初始化 Cloudflare WARP..."
+start_single_mode() {
+    echo "==> [MicroWARP] 单实例模式"
 
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) WGCF_ARCH="amd64" ;;
-        aarch64) WGCF_ARCH="arm64" ;;
-        *) echo "==> [ERROR] 不支持的架构: $ARCH"; exit 1 ;;
-    esac
+    local WG_CONF="${WG_DIR}/wg0.conf"
+    mkdir -p "$WG_DIR"
 
-    WGCF_VER=$(curl -sL https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
-    echo "==> [MicroWARP] 检测到最新 wgcf 版本: v${WGCF_VER}"
-    wget --timeout=15 -qO wgcf "$(build_wgcf_download_url "$WGCF_VER" "$WGCF_ARCH")"
-    chmod +x wgcf
-
-    echo "==> [MicroWARP] 正在向 CF 注册设备..."
-    ./wgcf register --accept-tos > /dev/null
-
-    echo "==> [MicroWARP] 正在生成 WireGuard 配置文件..."
-    ./wgcf generate > /dev/null
-
-    mv wgcf-profile.conf "$WG_CONF"
-
-    # 【核心安全】阅后即焚：删除注册工具和生成的账号明文文件
-    rm -f wgcf wgcf-account.toml
-    echo "==> [MicroWARP] 节点配置生成成功！"
-else
-    echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
-fi
-
-# ==========================================
-# 2. 强力洗白与内核兼容性处理 (防正则误杀版)
-# ==========================================
-
-# 1. 智能提取出纯 IPv4 地址 (防止 wgcf v2.2.30 将双栈 IP 写在同一行导致误杀)
-IPV4_ADDR=$(grep '^Address' "$WG_CONF" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -n 1)
-
-# 2. 物理删除所有原始的 Address, AllowedIPs, DNS，防止 RTNETLINK 崩溃或 DNS 死锁
-sed -i '/^Address/d' "$WG_CONF"
-sed -i '/^AllowedIPs/d' "$WG_CONF"
-sed -i '/^DNS.*/d' "$WG_CONF"
-
-# 3. 重建最纯净的 IPv4 路由规则
-if [ -n "$IPV4_ADDR" ]; then
-    sed -i "/\[Interface\]/a Address = $IPV4_ADDR" "$WG_CONF"
-fi
-sed -i "/\[Peer\]/a AllowedIPs = 0.0.0.0\/0" "$WG_CONF"
-
-# 删除 Alpine 系统自带 wg-quick 中不兼容的路由标记
-sed -i '/src_valid_mark/d' /usr/bin/wg-quick
-
-# 【新增：抗断流绝杀】强制注入 15 秒 UDP 心跳保活，对抗运营商 QoS 丢包
-if ! grep -q "PersistentKeepalive" "$WG_CONF"; then
-    sed -i '/\[Peer\]/a PersistentKeepalive = 15' "$WG_CONF"
-else
-    sed -i 's/PersistentKeepalive.*/PersistentKeepalive = 15/g' "$WG_CONF"
-fi
-
-# 【新增：防阻断绝杀】针对 HK/US 强校验机房，注入自定义优选 Endpoint IP
-if [ -n "$ENDPOINT_IP" ]; then
-    echo "==> [MicroWARP] 🔀 检测到自定义 Endpoint IP，正在覆盖默认节点: $ENDPOINT_IP"
-    sed -i "s/^Endpoint.*/Endpoint = $ENDPOINT_IP/g" "$WG_CONF"
-fi
-
-# ==========================================
-# 3. 拉起内核网卡
-# ==========================================
-# 在启用 WARP 前记录 100.64.0.0/10 的原始回程路径，避免发布端口后 Tailscale 客户端握手卡死
-PRE_WARP_ROUTE=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
-PRE_WARP_GW=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1)}')
-PRE_WARP_DEV=$(printf '%s\n' "$PRE_WARP_ROUTE" | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") print $(i + 1)}')
-
-echo "==> [MicroWARP] 正在启动 Linux 内核级 wg0 网卡..."
-wg-quick up wg0 > /dev/null 2>&1
-
-# 仅在 WARP 启动前确实存在原始回程路径时恢复 100.64.0.0/10，减少对非 Tailscale 场景的影响
-TAILSCALE_CIDR=${TAILSCALE_CIDR:-"100.64.0.0/10"}
-if [ -n "$PRE_WARP_GW" ] && [ -n "$PRE_WARP_DEV" ]; then
-    if ip route replace "$TAILSCALE_CIDR" via "$PRE_WARP_GW" dev "$PRE_WARP_DEV" > /dev/null 2>&1; then
-        echo "==> [MicroWARP] 已为 ${TAILSCALE_CIDR} 恢复 WARP 启动前的回程路由: via ${PRE_WARP_GW} dev ${PRE_WARP_DEV}"
+    if [ ! -f "$WG_CONF" ]; then
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        register_warp_account "$tmpdir"
+        mv "$tmpdir/wgcf-profile.conf" "$WG_CONF"
+        rm -rf "$tmpdir"
+        echo "==> [MicroWARP] 节点配置生成成功！"
+    else
+        echo "==> [MicroWARP] 检测到已有持久化配置，跳过注册。"
     fi
-fi
 
-echo "==> [MicroWARP] 当前出口 IP 已成功变更为："
-# 获取最新的 CF 溯源 IP (加入 5 秒强制超时，完美替代有缺陷的 & 后台执行)
-curl -s -m 5 https://1.1.1.1/cdn-cgi/trace | grep ip= || echo "⚠️ 获取超时 (可能是底层握手延迟或节点被强阻断)"
+    sanitize_wg_conf "$WG_CONF"
+
+    # 删除 wg-quick 中不兼容的路由标记
+    sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
+
+    # 记录 Tailscale 回程路由
+    local pre_warp_route pre_warp_gw pre_warp_dev
+    pre_warp_route=$(ip route get 100.64.0.1 2>/dev/null | head -n 1 || true)
+    pre_warp_gw=$(printf '%s\n' "$pre_warp_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+    pre_warp_dev=$(printf '%s\n' "$pre_warp_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+
+    echo "==> [MicroWARP] 正在启动 wg0..."
+    wg-quick up wg0 > /dev/null 2>&1
+
+    # 恢复 Tailscale 回程路由
+    local ts_cidr="${TAILSCALE_CIDR:-100.64.0.0/10}"
+    if [ -n "$pre_warp_gw" ] && [ -n "$pre_warp_dev" ]; then
+        if ip route replace "$ts_cidr" via "$pre_warp_gw" dev "$pre_warp_dev" > /dev/null 2>&1; then
+            echo "==> [MicroWARP] 已恢复 ${ts_cidr} 回程路由"
+        fi
+    fi
+
+    local exit_ip
+    exit_ip=$(get_exit_ip)
+    echo "==> [MicroWARP] 当前出口 IP: ${exit_ip:-unknown}"
+
+    # 启动 microsocks
+    local socks_args="-i $LISTEN_ADDR -p $LISTEN_PORT"
+    if [ -n "${SOCKS_USER:-}" ] && [ -n "${SOCKS_PASS:-}" ]; then
+        echo "==> [MicroWARP] 身份认证已开启 (User: $SOCKS_USER)"
+        socks_args="$socks_args -u $SOCKS_USER -P $SOCKS_PASS"
+    else
+        echo "==> [MicroWARP] ⚠️ 未设置密码，当前为公开访问模式"
+    fi
+
+    echo "==> [MicroWARP] MicroSOCKS 启动，监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
+    microsocks $socks_args &
+    MAIN_PIDS="$!"
+}
 
 # ==========================================
-# 4. 启动 C 语言 SOCKS5 代理服务 (带高级参数绑定)
+# 池化模式 (POOL_SIZE > 1)
 # ==========================================
-# 读取环境变量，如果未设置则使用默认值 0.0.0.0 和 1080
-LISTEN_ADDR=${BIND_ADDR:-"0.0.0.0"}
-LISTEN_PORT=${BIND_PORT:-"1080"}
 
-if [ -n "$SOCKS_USER" ] && [ -n "$SOCKS_PASS" ]; then
-    echo "==> [MicroWARP] 🔒 身份认证已开启 (User: $SOCKS_USER)"
-    echo "==> [MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    # 使用 exec 接管进程，实现 Zero-Overhead 的底层进程控制
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT" -u "$SOCKS_USER" -P "$SOCKS_PASS"
+init_pool_member() {
+    local id="$1"
+    local ns="warp${id}"
+    local veth="veth${id}"
+    local veth_ns="veth${id}_ns"
+    local main_ip="10.200.${id}.1"
+    local ns_ip="10.200.${id}.2"
+    local conf_dir="${POOL_DIR}/${id}"
+
+    echo "==> [MicroWARP] 初始化池成员 #${id}..."
+    mkdir -p "$conf_dir"
+
+    # 创建网络命名空间 + veth pair
+    ip netns add "$ns"
+    ip link add "$veth" type veth peer name "$veth_ns"
+    ip link set "$veth_ns" netns "$ns"
+
+    # 配置主命名空间端
+    ip addr add "${main_ip}/24" dev "$veth"
+    ip link set "$veth" up
+
+    # 配置 netns 端
+    ip netns exec "$ns" ip link set lo up
+    ip netns exec "$ns" ip addr add "${ns_ip}/24" dev "$veth_ns"
+    ip netns exec "$ns" ip link set "$veth_ns" up
+    ip netns exec "$ns" ip route add default via "$main_ip"
+
+    # 启用转发
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+
+    # 注册 WARP 账号 (在主命名空间注册，因为 netns 此时无外网)
+    if [ ! -f "${conf_dir}/wg0.conf" ]; then
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        register_warp_account "$tmpdir"
+        mv "$tmpdir/wgcf-profile.conf" "${conf_dir}/wg0.conf"
+        rm -rf "$tmpdir"
+    else
+        echo "==> [MicroWARP] 池成员 #${id} 已有配置，跳过注册"
+    fi
+
+    sanitize_wg_conf "${conf_dir}/wg0.conf"
+
+    # 删除 wg-quick 不兼容标记
+    sed -i '/src_valid_mark/d' /usr/bin/wg-quick 2>/dev/null || true
+
+    # 在 netns 中启动 WireGuard
+    ip netns exec "$ns" wg-quick up "${conf_dir}/wg0.conf" > /dev/null 2>&1
+
+    # 在 netns 中启动 microsocks
+    local socks_args="-i 0.0.0.0 -p 1080"
+    if [ -n "${SOCKS_USER:-}" ] && [ -n "${SOCKS_PASS:-}" ]; then
+        socks_args="$socks_args -u $SOCKS_USER -P $SOCKS_PASS"
+    fi
+    ip netns exec "$ns" microsocks $socks_args &
+    echo "$!" >> /tmp/microsocks_pids
+
+    local exit_ip
+    exit_ip=$(get_exit_ip "$ns")
+    echo "==> [MicroWARP] 池成员 #${id} 出口 IP: ${exit_ip:-unknown}"
+}
+
+setup_iptables_loadbalance() {
+    local pool_size="$1"
+    local port="$2"
+    local i=0
+
+    # 清理旧规则
+    iptables -t nat -F MICROWARP_POOL 2>/dev/null || true
+    iptables -t nat -D PREROUTING -p tcp --dport "$port" -j MICROWARP_POOL 2>/dev/null || true
+    iptables -t nat -X MICROWARP_POOL 2>/dev/null || true
+
+    # 创建自定义链
+    iptables -t nat -N MICROWARP_POOL
+    iptables -t nat -A PREROUTING -p tcp --dport "$port" -j MICROWARP_POOL
+
+    while [ $i -lt "$pool_size" ]; do
+        local remaining=$((pool_size - i))
+        local target_ip="10.200.${i}.2"
+
+        if [ $remaining -eq 1 ]; then
+            iptables -t nat -A MICROWARP_POOL -j DNAT --to-destination "${target_ip}:1080"
+        else
+            iptables -t nat -A MICROWARP_POOL \
+                -m statistic --mode nth --every "$remaining" --packet 0 \
+                -j DNAT --to-destination "${target_ip}:1080"
+        fi
+        i=$((i + 1))
+    done
+
+    # MASQUERADE 回程流量
+    iptables -t nat -A POSTROUTING -s 10.200.0.0/16 -j MASQUERADE
+
+    echo "==> [MicroWARP] iptables 轮询负载均衡已配置 (${pool_size} 个成员)"
+}
+
+start_pool_mode() {
+    echo "==> [MicroWARP] 池化模式 (POOL_SIZE=${POOL_SIZE})"
+
+    mkdir -p "$POOL_DIR"
+    rm -f /tmp/microsocks_pids
+
+    local i=0
+    while [ $i -lt "$POOL_SIZE" ]; do
+        init_pool_member "$i"
+        i=$((i + 1))
+        # 注册间延迟，防 CF 速率限制
+        if [ $i -lt "$POOL_SIZE" ]; then
+            sleep 2
+        fi
+    done
+
+    setup_iptables_loadbalance "$POOL_SIZE" "$LISTEN_PORT"
+
+    echo "==> [MicroWARP] 池化 SOCKS5 代理已启动，监听 :${LISTEN_PORT}"
+}
+
+# ==========================================
+# 信号处理
+# ==========================================
+
+handle_sigusr1() {
+    local random_id
+    if [ "$POOL_SIZE" -le 1 ]; then
+        random_id=0
+    else
+        random_id=$(shuf -i 0-$((POOL_SIZE - 1)) -n 1)
+    fi
+    echo "==> [MicroWARP] 轮换池成员 #${random_id}..."
+    /app/rotate.sh "$random_id" || true
+}
+
+handle_exit() {
+    echo "==> [MicroWARP] 正在清理..."
+
+    # 停止 microsocks
+    if [ -f /tmp/microsocks_pids ]; then
+        while IFS= read -r pid; do
+            kill "$pid" 2>/dev/null || true
+        done < /tmp/microsocks_pids
+    fi
+    [ -n "${MAIN_PIDS:-}" ] && kill $MAIN_PIDS 2>/dev/null || true
+    [ -n "${HTTPD_PID:-}" ] && kill "$HTTPD_PID" 2>/dev/null || true
+
+    # 停止 WireGuard
+    if [ "$POOL_SIZE" -le 1 ]; then
+        wg-quick down wg0 2>/dev/null || true
+    else
+        local i=0
+        while [ $i -lt "$POOL_SIZE" ]; do
+            ip netns exec "warp${i}" wg-quick down "${POOL_DIR}/${i}/wg0.conf" 2>/dev/null || true
+            ip netns delete "warp${i}" 2>/dev/null || true
+            i=$((i + 1))
+        done
+    fi
+
+    echo "==> [MicroWARP] 已停止"
+    exit 0
+}
+
+# ==========================================
+# 主流程
+# ==========================================
+
+# 导出变量供 rotate.sh 和 CGI 使用
+export POOL_SIZE POOL_DIR LISTEN_PORT
+export ENDPOINT_IP WARP_LICENSE WARP_KEY_API
+export SOCKS_USER SOCKS_PASS TAILSCALE_CIDR
+
+if [ "$POOL_SIZE" -le 1 ]; then
+    start_single_mode
 else
-    echo "==> [MicroWARP] ⚠️ 未设置密码，当前为公开访问模式"
-    echo "==>[MicroWARP] 🚀 MicroSOCKS 引擎已启动，正在监听 ${LISTEN_ADDR}:${LISTEN_PORT}"
-    exec microsocks -i "$LISTEN_ADDR" -p "$LISTEN_PORT"
+    start_pool_mode
 fi
+
+# 启动管理 API
+if [ -n "${API_PORT:-}" ]; then
+    echo "==> [MicroWARP] 管理 API 启动，监听 :${API_PORT}"
+    httpd -f -p "0.0.0.0:${API_PORT}" -h /app -c /app/httpd.conf &
+    HTTPD_PID=$!
+fi
+
+# 注册信号
+trap handle_sigusr1 USR1
+trap handle_exit TERM INT
+
+echo "==> [MicroWARP] 初始化完成"
+set +e
+while true; do
+    # 等待任意子进程退出
+    wait -n 2>/dev/null || wait
+    # 检测关键进程是否存活
+    if [ "$POOL_SIZE" -le 1 ]; then
+        if [ -n "${MAIN_PIDS:-}" ] && ! kill -0 "$MAIN_PIDS" 2>/dev/null; then
+            echo "==> [MicroWARP] microsocks 进程异常退出，容器终止"
+            handle_exit
+        fi
+    else
+        # 池化模式: 检测是否还有存活的 microsocks
+        if [ -f /tmp/microsocks_pids ]; then
+            alive=0
+            while IFS= read -r pid; do
+                kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+            done < /tmp/microsocks_pids
+            if [ "$alive" -eq 0 ]; then
+                echo "==> [MicroWARP] 所有 microsocks 进程已退出，容器终止"
+                handle_exit
+            fi
+        fi
+    fi
+done
