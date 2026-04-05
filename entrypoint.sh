@@ -202,6 +202,12 @@ start_pool_mode() {
     mkdir -p "$POOL_DIR"
     rm -f /tmp/microsocks_pids
 
+    # 提前启用转发和 MASQUERADE (WireGuard 握手需要)
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    iptables -A FORWARD -i veth+ -o eth0 -j ACCEPT 2>/dev/null || true
+    iptables -A FORWARD -i eth0 -o veth+ -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -t nat -A POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null || true
+
     local i=0
     while [ $i -lt "$POOL_SIZE" ]; do
         init_pool_member "$i"
